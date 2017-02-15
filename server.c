@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
+#include "threadpool.h"
 #include "make_log.h"
 //for http
 //#include <evhttp.h>
@@ -23,7 +24,10 @@
 
 #define MYHTTPD_SIGNATURE "myhttpd v 0.0.1"
 #define MYDIR "/home/ubuntu/http/mydir"
-#define N 4096
+#define N 2048
+#define MIN_PTHREAD 10
+#define MAX_PTHREAD 100
+
 //判断文件是否存在
 
 pthread_mutex_t mutex;
@@ -61,8 +65,8 @@ void send_headers(struct evhttp_request *req,char *type)
 		return;
 	}
 	evhttp_add_header(req->output_headers, "Server", MYHTTPD_SIGNATURE);
-		evhttp_add_header(req->output_headers, "Content-Type", type);
-		evhttp_add_header(req->output_headers, "Connection", "close");
+	evhttp_add_header(req->output_headers, "Content-Type", type);
+	evhttp_add_header(req->output_headers, "Connection", "close");
 }
 //发送错误页面
 void send_error(struct evhttp_request *req,int status,char *title,char *text)
@@ -133,7 +137,7 @@ void read_dir(struct evhttp_request *req,char *absolute_path,char *path)
 
 void *pthread_handler(void *arg)
 {
-	struct evhttp_request *req=(struct evhttp_request *)arg;
+		struct evhttp_request *req=(struct evhttp_request *)arg;
 		if(req==NULL)
 		{
 				LOG("server_log","server_log","%s,%d,req==NULL",__FILE__,__LINE__);
@@ -141,8 +145,8 @@ void *pthread_handler(void *arg)
 				//pthread_exit(NULL);
 				return NULL;
 		}
-	char output[2048] = "\0";
-		char tmp[1024];
+		char output[N] = "\0";
+		char tmp[N];
 		char * file;
 		FILE *fp;
 		char *type=NULL;
@@ -189,10 +193,10 @@ void *pthread_handler(void *arg)
 	if(decoded_uri[0]!='/')
 	{
 		LOG("server_log","server_log","%s,%d,decoded_uri[0]!='/'",__FILE__,__LINE__);
-			send_error(req,400, "Bad Request", "Bad filename.");
-			free(decoded_uri);
-			//pthread_exit(NULL);
-			return NULL;
+		send_error(req,400, "Bad Request", "Bad filename.");
+		free(decoded_uri);
+		//pthread_exit(NULL);
+		return NULL;
 	}
 	//文件的绝对路径
 	char absolute_path[N]={0};
@@ -232,7 +236,8 @@ void *pthread_handler(void *arg)
 			//pthread_exit(NULL);
 			return NULL;
 	}
-	fp=fopen(file,"r");
+		pthread_mutex_lock(&mutex);
+		fp=fopen(file,"r");
 		if(fp==NULL)
 		{
 			LOG("server_log","server_log","%s,%d,fopen error",__FILE__,__LINE__);
@@ -281,13 +286,13 @@ void *pthread_handler(void *arg)
 		send_headers(req,type);
 		struct evbuffer *buf;
 		buf = evbuffer_new();
-		char readBuf[1024]={0};
+		char readBuf[N]={0};
 		int num=-1;
-		pthread_mutex_lock(&mutex);
-		while((num=fread(readBuf,1,1024,fp))>0)
+		
+		while((num=fread(readBuf,1,N,fp))>0)
 		{
 			evbuffer_add(buf,readBuf,num);
-			memset(readBuf,0,1024);
+			memset(readBuf,0,N);
 		} 
 		pthread_mutex_unlock(&mutex);
 	  evhttp_send_reply(req, HTTP_OK, "OK", buf);
@@ -300,17 +305,15 @@ void *pthread_handler(void *arg)
 //事件处理函数
 void httpd_handler(struct evhttp_request *req, void *arg) 
 {
-	
-		pthread_t pid;
-		int ret = pthread_create(&pid,NULL,pthread_handler,(void *)req);
-		if(ret!=0)
-		{
-			  LOG("server_log","server_log","%s,%d,pthread_create error",__FILE__,__LINE__);
-				send_error(req,405, "pthread_create error", "pthread_create error");
-				return;
-		}
-	pthread_detach(pid);
-		return ;
+	threadpool_t *thp=(threadpool_t *)arg;
+	int ret=threadpool_add(thp,pthread_handler,(void *)req);
+	if(ret!=0)
+	{
+		LOG("server_log","server_log","%s,%d,threadpool_add error",__FILE__,__LINE__);
+		send_error(req,405, "pthread_create error", "pthread_create error");
+		return;
+	}
+	return ;
 }
 
 
@@ -401,14 +404,25 @@ int main(int argc, char *argv[])
 		//创建一个http server
 		struct evhttp *httpd;
 		httpd = evhttp_start(httpd_option_listen, httpd_option_port);
+		
+		threadpool_t *thp = threadpool_create(MIN_PTHREAD,MAX_PTHREAD,MAX_PTHREAD);
+		if(thp==NULL)
+		{
+			LOG("server_log","server_log","%s,%d,create_pthreadpool error",__FILE__,__LINE__);
+			event_base_dispatch(base); 
+			evhttp_free(httpd);
+			pthread_mutex_destroy(&mutex);
+			return 0;
+		}
 		evhttp_set_timeout(httpd, httpd_option_timeout);
 		//指定generic callback
-		evhttp_set_gencb(httpd, httpd_handler, NULL);
+		evhttp_set_gencb(httpd, httpd_handler, (void *)thp);
 		//也可以为特定的URI指定callback
 		//evhttp_set_cb(httpd, "/", specific_handler, NULL);
 		//循环处理events
 		event_base_dispatch(base); 
 		evhttp_free(httpd);
+		threadpool_destroy(thp);
 		pthread_mutex_destroy(&mutex);
 		return 0;
 }
